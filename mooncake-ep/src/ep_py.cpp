@@ -38,7 +38,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",
-             &MooncakeEpBuffer::get_next_combine_buffer);
+             &MooncakeEpBuffer::get_next_combine_buffer)
+        .def("afpd_dispatch_send", &MooncakeEpBuffer::afpd_dispatch_send)
+        .def("afpd_dispatch_recv", &MooncakeEpBuffer::afpd_dispatch_recv)
+        .def("afpd_combine_send", &MooncakeEpBuffer::afpd_combine_send)
+        .def("afpd_combine_recv", &MooncakeEpBuffer::afpd_combine_recv);
 }
 
 }  // namespace mooncake

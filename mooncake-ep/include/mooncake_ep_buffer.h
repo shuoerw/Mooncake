@@ -133,6 +133,41 @@ struct MooncakeEpBuffer {
             int timeout_us, bool zero_copy, bool async, bool return_recv_hook,
             const std::optional<torch::Tensor>& out);
 
+    // === AFPD methods (POC) ===
+    // Thin per-role wrappers around mooncake::afpd::* host launchers.
+    // The Python-level AFPDMooncakeDispatcher owns layout/buffer setup; these
+    // methods accept tensors that are already set up correctly by Python.
+
+    // Attn role: send hidden_states+topk_idx to expert (fire-and-forget).
+    void afpd_dispatch_send(const torch::Tensor& x, const torch::Tensor& topk_idx,
+                            int num_max_dispatch_tokens_per_rank, int num_experts,
+                            int my_attn_rank, int expert_rank_base,
+                            int num_attn_ranks, int num_expert_ranks,
+                            int dst_arena_idx, bool use_fp8);
+
+    // Expert role: pull tokens for ONE arena. Returns (recv_x, scales, src_info, layout_range, count).
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
+               torch::Tensor, torch::Tensor>
+    afpd_dispatch_recv(int num_max_dispatch_tokens_per_rank,
+                       int hidden, int num_local_experts,
+                       int src_attn_rank, int num_attn_ranks,
+                       int arena_idx, bool use_fp8);
+
+    // Expert role: send weighted expert outputs back to one attn rank.
+    void afpd_combine_send(const torch::Tensor& x_local,
+                           const torch::Tensor& src_info,
+                           const torch::Tensor& layout_range,
+                           int num_max_dispatch_tokens_per_rank,
+                           int num_local_experts,
+                           int my_expert_rank_in_role, int dst_attn_rank,
+                           int dst_arena_idx);
+
+    // Attn role: block on per-expert flags then reduce topk values into combined_x.
+    torch::Tensor afpd_combine_recv(const torch::Tensor& topk_idx,
+                                    const torch::Tensor& topk_weights,
+                                    int num_combined_tokens, int hidden, int num_experts,
+                                    int my_attn_rank, int num_attn_ranks);
+
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts);
 

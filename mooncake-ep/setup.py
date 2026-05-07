@@ -39,6 +39,7 @@ setup(
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
+                "src/mooncake_ep_kernel_afpd.cu",
                 "src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={

@@ -1,4 +1,5 @@
 #include <mooncake_ep_buffer.h>
+#include <mooncake_ep_buffer_afpd.h>
 #include <arpa/inet.h>
 #include <glog/logging.h>
 
@@ -817,6 +818,208 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                           num_ranks * sizeof(int32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ipc_peer_ptrs, ipc_peer_ptrs_host,
                           num_ranks * sizeof(void*), cudaMemcpyHostToDevice));
+}
+
+// === AFPD methods (POC) ===
+// These methods all rely on the Buffer's existing IPC handle setup
+// (sync_nvlink_ipc_handles must have been called) and the BufferPair-layout
+// gdr_buffer. They are intended for the M1 single-node NVLink path; IBGDA
+// will be reintroduced in M2 alongside the buffer struct refactor.
+
+namespace afpd_internal {
+inline at::cuda::CUDAStream get_stream() {
+    return at::cuda::getCurrentCUDAStream();
+}
+}  // namespace afpd_internal
+
+// One arena per (prefill+decode) attn rank on each expert rank. Each arena
+// is sized num_local_experts * num_max_dispatch_tokens * num_bytes_per_msg.
+// Caller passes arena_idx; we compute the byte offset within the recv slab.
+inline int64_t compute_afpd_arena_offset(int num_max_dispatch_tokens_per_rank,
+                                         int hidden, int num_local_experts,
+                                         int num_expert_ranks,
+                                         int arena_idx, bool use_fp8) {
+    const int num_scales = hidden / 128;
+    const int64_t num_bytes_per_msg =
+        static_cast<int64_t>(sizeof(int4)) +
+        (use_fp8 ? (hidden + num_scales * static_cast<int64_t>(sizeof(float)))
+                 : (hidden * static_cast<int64_t>(sizeof(__nv_bfloat16))));
+    const int64_t arena_size_bytes =
+        static_cast<int64_t>(num_local_experts) *
+        static_cast<int64_t>(num_max_dispatch_tokens_per_rank) *
+        num_bytes_per_msg;
+    return static_cast<int64_t>(arena_idx) * arena_size_bytes;
+    (void)num_expert_ranks;  // reserved for non-uniform shard layouts
+}
+
+
+void MooncakeEpBuffer::afpd_dispatch_send(const torch::Tensor& x,
+                                          const torch::Tensor& topk_idx,
+                                          int num_max_dispatch_tokens_per_rank,
+                                          int num_experts,
+                                          int my_attn_rank,
+                                          int expert_rank_base,
+                                          int num_attn_ranks,
+                                          int num_expert_ranks,
+                                          int dst_arena_idx,
+                                          bool use_fp8) {
+    EP_HOST_ASSERT(x.is_cuda() && topk_idx.is_cuda());
+    EP_HOST_ASSERT(x.dim() == 2);
+    EP_HOST_ASSERT(topk_idx.dim() == 2);
+
+    // Layout: BufferPair[buffer_idx] gives this rank's send/recv pointers
+    // (ping-pong indexed). Caller toggles buffer_idx between AFPD calls if
+    // it wants to overlap; M1 keeps it on 0.
+    BufferPair pair(gdr_buffer, num_max_dispatch_tokens_per_rank, x.size(1),
+                    num_attn_ranks + 1, num_experts);
+    auto& bl = pair.buffers[buffer_idx];
+
+    auto stream = afpd_internal::get_stream();
+    mooncake::afpd::dispatch_afpd_send(
+        gdr_buffer,
+        bl.rdma_send_signal_buffer,
+        bl.rdma_send_data_buffer,
+        raddrs, rkeys, qp_devctxs,
+        nvlink_available, ipc_peer_ptrs,
+        x.data_ptr(),
+        reinterpret_cast<const int64_t*>(topk_idx.data_ptr()),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(x.size(1)),
+        num_max_dispatch_tokens_per_rank,
+        static_cast<int>(topk_idx.size(1)),
+        num_experts,
+        my_attn_rank, expert_rank_base, num_attn_ranks, num_expert_ranks,
+        compute_afpd_arena_offset(num_max_dispatch_tokens_per_rank,
+                                   static_cast<int>(x.size(1)), num_experts,
+                                   num_expert_ranks, dst_arena_idx, use_fp8),
+        use_fp8,
+        workspace, stream.stream(), -1, 1);
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
+           torch::Tensor, torch::Tensor>
+MooncakeEpBuffer::afpd_dispatch_recv(int num_max_dispatch_tokens_per_rank,
+                                      int hidden, int num_local_experts,
+                                      int src_attn_rank, int num_attn_ranks,
+                                      int arena_idx,
+                                      bool use_fp8) {
+    auto opts = torch::TensorOptions().device(torch::kCUDA, device_id);
+    auto bf16 = opts.dtype(torch::kBFloat16);
+    auto i32  = opts.dtype(torch::kInt32);
+    auto i64  = opts.dtype(torch::kInt64);
+    auto f32  = opts.dtype(torch::kFloat32);
+
+    auto packed_recv_x = torch::empty(
+        {num_local_experts, num_max_dispatch_tokens_per_rank, hidden},
+        use_fp8 ? opts.dtype(torch::kFloat8_e4m3fn) : bf16);
+    std::optional<torch::Tensor> packed_recv_x_scales;
+    if (use_fp8) {
+        const int num_scales = hidden / 128;
+        packed_recv_x_scales = torch::empty(
+            {num_local_experts, num_scales, num_max_dispatch_tokens_per_rank}, f32);
+    }
+    auto packed_recv_src_info = torch::empty(
+        {num_local_experts, num_max_dispatch_tokens_per_rank}, i32);
+    auto packed_recv_layout_range = torch::empty({num_local_experts}, i64);
+    auto packed_recv_count = torch::zeros({num_local_experts}, i32);
+    auto active_ranks = torch::ones({1}, i32);
+
+    BufferPair pair(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
+                    num_attn_ranks + 1, num_local_experts);
+    auto& bl = pair.buffers[buffer_idx];
+    // M1 POC: we treat the expert's BufferPair as already-shifted to the chosen arena.
+    // Multi-arena buffer layout lands in PASS-F.
+    (void)src_attn_rank;
+
+    auto stream = afpd_internal::get_stream();
+    // Shift recv pointers to this arena's region within the gdr_buffer.
+    int64_t arena_off = compute_afpd_arena_offset(num_max_dispatch_tokens_per_rank,
+                                                   hidden, num_local_experts,
+                                                   /*num_expert_ranks=*/1,
+                                                   arena_idx, use_fp8);
+    int* recv_signal = reinterpret_cast<int*>(
+        reinterpret_cast<char*>(bl.rdma_recv_signal_buffer) + arena_off);
+    void* recv_data = reinterpret_cast<void*>(
+        reinterpret_cast<char*>(bl.rdma_recv_data_buffer) + arena_off);
+    mooncake::afpd::dispatch_afpd_recv(
+        packed_recv_x.data_ptr(),
+        use_fp8 ? packed_recv_x_scales.value().data_ptr<float>() : nullptr,
+        packed_recv_src_info.data_ptr<int>(),
+        packed_recv_layout_range.data_ptr<int64_t>(),
+        packed_recv_count.data_ptr<int>(),
+        active_ranks.data_ptr<int32_t>(),
+        gdr_buffer,
+        recv_signal,
+        recv_data,
+        hidden, num_max_dispatch_tokens_per_rank,
+        0, num_local_experts,
+        src_attn_rank, num_attn_ranks,
+        use_fp8, workspace, stream.stream(), -1);
+    return {packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
+            packed_recv_layout_range, packed_recv_count};
+}
+
+void MooncakeEpBuffer::afpd_combine_send(const torch::Tensor& x_local,
+                                          const torch::Tensor& src_info,
+                                          const torch::Tensor& layout_range,
+                                          int num_max_dispatch_tokens_per_rank,
+                                          int num_local_experts,
+                                          int my_expert_rank_in_role, int dst_attn_rank,
+                                          int dst_arena_idx) {
+    EP_HOST_ASSERT(x_local.is_cuda());
+    BufferPair pair(gdr_buffer, num_max_dispatch_tokens_per_rank,
+                    static_cast<int>(x_local.size(-1)),
+                    /*num_world_ranks=*/2, num_local_experts);  // attn=1 + expert=1
+    auto& bl = pair.buffers[buffer_idx];
+
+    auto stream = afpd_internal::get_stream();
+    mooncake::afpd::combine_afpd_send(
+        gdr_buffer,
+        bl.rdma_send_signal_buffer,
+        bl.rdma_send_data_buffer,
+        raddrs, rkeys, qp_devctxs,
+        nvlink_available, ipc_peer_ptrs,
+        x_local.data_ptr(),
+        src_info.data_ptr<int>(),
+        layout_range.data_ptr<int64_t>(),
+        num_max_dispatch_tokens_per_rank,
+        static_cast<int>(x_local.size(-1)),
+        0, num_local_experts,
+        my_expert_rank_in_role, dst_attn_rank,
+        compute_afpd_arena_offset(num_max_dispatch_tokens_per_rank,
+                                   static_cast<int>(x_local.size(-1)),
+                                   num_local_experts,
+                                   /*num_expert_ranks=*/1,
+                                   dst_arena_idx, /*use_fp8=*/false),
+        workspace, stream.stream(), 1);
+}
+
+torch::Tensor MooncakeEpBuffer::afpd_combine_recv(const torch::Tensor& topk_idx,
+                                                   const torch::Tensor& topk_weights,
+                                                   int num_combined_tokens, int hidden,
+                                                   int num_experts,
+                                                   int my_attn_rank, int num_attn_ranks) {
+    auto opts = torch::TensorOptions().device(torch::kCUDA, device_id).dtype(torch::kBFloat16);
+    auto combined_x = torch::empty({num_combined_tokens, hidden}, opts);
+
+    BufferPair pair(gdr_buffer, /*num_max_dispatch_tokens_per_rank=*/1024,
+                    hidden, num_attn_ranks + 1, num_experts);
+    auto& bl = pair.buffers[buffer_idx];
+    auto active_ranks = torch::ones({1}, opts.dtype(torch::kInt32));
+
+    auto stream = afpd_internal::get_stream();
+    mooncake::afpd::combine_afpd_recv(
+        combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(),
+        gdr_buffer,
+        bl.rdma_recv_signal_buffer, bl.rdma_recv_data_buffer,
+        reinterpret_cast<const int64_t*>(topk_idx.data_ptr()),
+        topk_weights.data_ptr<float>(),
+        num_combined_tokens, hidden, static_cast<int>(topk_idx.size(1)),
+        /*num_max_dispatch_tokens_per_rank=*/1024, num_experts,
+        my_attn_rank, num_attn_ranks,
+        workspace, stream.stream(), -1);
+    (void)my_attn_rank;
+    return combined_x;
 }
 
 }  // namespace mooncake
